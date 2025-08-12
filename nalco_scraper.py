@@ -5,6 +5,12 @@ from bs4 import BeautifulSoup
 import pdfplumber
 import pandas as pd
 
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, numbers
+from openpyxl.utils import get_column_letter
+
+# ---------------------- CONFIG ----------------------
+
 NALCO_URL = "https://nalcoindia.com/domestic/current-price/"
 PDF_DIR = pathlib.Path("pdfs")
 DATA_DIR = pathlib.Path("data")
@@ -14,7 +20,13 @@ EXCEL_FILE = DATA_DIR / "nalco_prices.xlsx"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
+# prefer "Ingot-DD-MM-YYYY.pdf" and exclude spec docs
 DATEY_PDF_RE = re.compile(r"Ingot-(\d{2})-(\d{2})-(\d{4})\.pdf$", re.IGNORECASE)
+
+# Final Excel column order
+EXCEL_COLS = ["Sl.no.", "Description", "Product Code", "Basic Price", "Circular Date", "Circular Link"]
+
+# ---------------------- SCRAPER UTILS ----------------------
 
 def ensure_dirs():
     for p in (PDF_DIR, DATA_DIR):
@@ -32,7 +44,8 @@ def norm(s: str) -> str:
 
 def find_ingots_pdf_url(html):
     soup = BeautifulSoup(html, "html.parser")
-    # Strict: <a><img><p>Ingots</p></a>
+
+    # STRICT: <a ...><img ...><p>Ingots</p></a>
     for pnode in soup.find_all("p"):
         if norm(pnode.get_text()) == "ingots":
             a = pnode.find_parent("a", href=True)
@@ -48,7 +61,7 @@ def find_ingots_pdf_url(html):
             if DATEY_PDF_RE.search(href):
                 return urljoin(NALCO_URL, href)
 
-    # Last resort: any PDF link whose anchor text contains "ingot" (not spec)
+    # Fallback: any PDF link whose anchor text mentions "ingot" (not spec)
     for a in soup.find_all("a", href=True):
         txt = norm(a.get_text())
         href = a["href"].strip()
@@ -88,10 +101,10 @@ def download_pdf(url):
                     f.write(chunk)
         return dest
 
-# ---------- PDF PARSE HELPERS ----------
+# ---------------------- PDF PARSING ----------------------
 
 def parse_circular_date_from_filename(pdf_path: pathlib.Path) -> str:
-    """Extract DD-MM-YYYY from 'Ingot-DD-MM-YYYY.pdf' else use today."""
+    """Extract DD-MM-YYYY from 'Ingot-DD-MM-YYYY.pdf', else use today."""
     m = DATEY_PDF_RE.search(pdf_path.name)
     if m:
         dd, mm, yyyy = m.groups()
@@ -100,16 +113,12 @@ def parse_circular_date_from_filename(pdf_path: pathlib.Path) -> str:
             return d.strftime("%d-%m-%Y")
         except ValueError:
             pass
-    # fallback: today (IST not available here; using UTC date is fine for record)
     return datetime.date.today().strftime("%d-%m-%Y")
 
 def extract_row_ie07(pdf_path: pathlib.Path):
     """
     Find the row that contains 'IE07'.
     Returns dict: { 'Description', 'Product Code', 'Basic Price' }
-    Strategy:
-      - Try pdfplumber.extract_tables first.
-      - If that fails/empty, use word positions to find the line with IE07 and parse neighbors.
     """
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
@@ -119,44 +128,37 @@ def extract_row_ie07(pdf_path: pathlib.Path):
             except Exception:
                 tables = []
             for tbl in tables or []:
-                # Normalize cells
                 for row in tbl:
                     cells = [(c or "").strip() for c in row]
                     if any(re.fullmatch(r"IE07", x, flags=re.IGNORECASE) for x in cells):
-                        # Expect columns like: SlNo, Description, ProductCode, BasicPrice, ...
-                        # We'll try to map by best guess:
                         desc = ""
-                        code = ""
+                        code = "IE07"
                         price = ""
-                        # Find product code index
                         idx_code = None
                         for i, c in enumerate(cells):
                             if re.fullmatch(r"IE07", c, flags=re.IGNORECASE):
                                 idx_code = i
-                                code = "IE07"
                                 break
-                        # Description: try the previous meaningful column
                         if idx_code is not None:
-                            # look left for a non-empty text that's not a number
+                            # description: look left for non-numeric text
                             for j in range(idx_code - 1, -1, -1):
                                 if cells[j] and not re.fullmatch(r"\d+(\.\d+)?", cells[j]):
                                     desc = cells[j]
                                     break
-                            # Price: try immediate next numeric-like field to the right
+                            # price: first numeric-looking to right
                             for j in range(idx_code + 1, len(cells)):
                                 if re.search(r"\d", cells[j]):
                                     price = cells[j].replace(",", "")
                                     break
                         if code and price:
                             return {
-                                "Description": desc or "ALUMINIUM INGOT",
+                                "Description": (desc or "ALUMINIUM INGOT").upper(),
                                 "Product Code": code,
                                 "Basic Price": price
                             }
 
-            # Fallback: text line scan around 'IE07'
+            # Fallback: line text scan
             words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
-            # Group words by y (line) with small tolerance
             lines = {}
             for w in words:
                 y = round(w["top"], 1)
@@ -164,11 +166,8 @@ def extract_row_ie07(pdf_path: pathlib.Path):
             for y, wlist in lines.items():
                 text_line = " ".join([w["text"] for w in sorted(wlist, key=lambda x: x["x0"])])
                 if re.search(r"\bIE07\b", text_line, flags=re.IGNORECASE):
-                    # Try to capture price (a large integer like 268250) and description left of code
-                    # Price: last big number on the line
                     m_price = re.search(r"(\d{5,7}(?:\.\d+)?)\s*$", text_line)
                     price = (m_price.group(1) if m_price else "").replace(",", "")
-                    # Description: assume contains 'INGOT' on the same line
                     m_desc = re.search(r"([A-Z ]*INGOT[A-Z ]*)\b", text_line, flags=re.IGNORECASE)
                     desc = (m_desc.group(1) if m_desc else "ALUMINIUM INGOT").strip().upper()
                     if price:
@@ -177,14 +176,10 @@ def extract_row_ie07(pdf_path: pathlib.Path):
                             "Product Code": "IE07",
                             "Basic Price": price
                         }
-
     raise RuntimeError("Could not find a row with Product Code IE07 in the PDF.")
 
 def to_thousands(value_str: str) -> float:
-    """
-    Convert raw price (e.g., '268250') to thousands (e.g., 268.250).
-    Returns a float with 3 decimal places preserved on write.
-    """
+    """Convert raw price (e.g., '268250') to thousands (e.g., 268.250)."""
     value_str = value_str.replace(",", "").strip()
     if not value_str:
         return None
@@ -194,37 +189,108 @@ def to_thousands(value_str: str) -> float:
     except ValueError:
         return None
 
+# ---------------------- EXCEL HELPERS ----------------------
+
+def sort_and_format_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Sort by Circular Date (desc) for display. Keep Basic Price numeric (3 decimals)."""
+    # Parse and store temp date for sorting
+    dtd = pd.to_datetime(df["Circular Date"], dayfirst=True, errors="coerce")
+    df = df.assign(_date=dtd)
+
+    # Sort: latest date first; if tie, smaller Sl.no. first
+    df = df.sort_values(by=["_date", "Sl.no."], ascending=[False, True], kind="stable").drop(columns=["_date"])
+
+    # Normalize types/format
+    df["Basic Price"] = pd.to_numeric(df["Basic Price"], errors="coerce").round(3)
+    df["Circular Date"] = pd.to_datetime(df["Circular Date"], dayfirst=True, errors="coerce").dt.strftime("%d-%m-%Y")
+
+    return df
+
+def save_excel_formatted(df: pd.DataFrame, path: pathlib.Path):
+    """
+    Save df to Excel, auto-fit column widths based on content,
+    center-align all cells, and make Circular Link clickable.
+    """
+    # Write with pandas first
+    df.to_excel(path, index=False)
+
+    # Open with openpyxl to format
+    wb = load_workbook(path)
+    ws = wb.active
+
+    # Center alignment for all cells
+    center = Alignment(horizontal="center", vertical="center")
+
+    # Determine max width for each column (header + data)
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        max_len = len(str(col_name))
+        for val in df[col_name].astype(str).values:
+            if val is None:
+                continue
+            max_len = max(max_len, len(val))
+        # add a little padding
+        ws.column_dimensions[get_column_letter(col_idx)].width = max(10, min(max_len + 2, 80))
+
+    # Apply center alignment + number format for Basic Price
+    header_row = 1
+    nrows = ws.max_row
+    ncols = ws.max_column
+    price_col_idx = EXCEL_COLS.index("Basic Price") + 1
+    link_col_idx = EXCEL_COLS.index("Circular Link") + 1
+
+    for r in range(1, nrows + 1):
+        for c in range(1, ncols + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.alignment = center
+            # Number format for price column (3 decimals) for data rows
+            if r > header_row and c == price_col_idx:
+                cell.number_format = "0.000"
+            # Hyperlink for Circular Link data rows
+            if r > header_row and c == link_col_idx:
+                val = cell.value
+                if isinstance(val, str) and val.startswith("http"):
+                    cell.hyperlink = val
+                    # keep text as is; Excel will show it as clickable
+
+    # Freeze header
+    ws.freeze_panes = "A2"
+
+    wb.save(path)
+
 def append_to_excel(excel_path: pathlib.Path, row: dict):
     """
-    Append a row to Excel with headers:
-    Sl.no. | Description | Product Code | Basic Price | Circular Date | Circular Link
-    Sl.no. increments by existing row count (excluding header).
+    Append a row, assign next Sl.no. based on existing max (robust even after sorting),
+    then sort by Circular Date (desc) before saving with formatting.
     """
-    cols = ["Sl.no.", "Description", "Product Code", "Basic Price", "Circular Date", "Circular Link"]
-
     if excel_path.exists():
-        df = pd.read_excel(excel_path)
-        # Ensure correct columns/order if file was created manually
-        df = df.reindex(columns=cols, fill_value=None)
-        next_slno = int(df.shape[0] + 1)
+        df = pd.read_excel(excel_path, dtype={"Sl.no.": "Int64"})
+        # ensure expected columns
+        for c in EXCEL_COLS:
+            if c not in df.columns:
+                df[c] = pd.NA
+        df = df[EXCEL_COLS]
+        if df["Sl.no."].notna().any():
+            next_slno = int(df["Sl.no."].max()) + 1
+        else:
+            next_slno = 1
     else:
-        df = pd.DataFrame(columns=cols)
+        df = pd.DataFrame(columns=EXCEL_COLS)
         next_slno = 1
 
     new_row = {
         "Sl.no.": next_slno,
         "Description": row["Description"],
         "Product Code": row["Product Code"],
-        "Basic Price": row["Basic Price"],  # already divided by 1000
+        "Basic Price": row["Basic Price"],    # already divided by 1000 upstream
         "Circular Date": row["Circular Date"],
         "Circular Link": row["Circular Link"],
     }
 
     df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-    # Keep three decimals in Excel for Basic Price by writing as number; pandas keeps numeric type.
-    df.to_excel(excel_path, index=False)
+    df = sort_and_format_df(df)
+    save_excel_formatted(df, excel_path)
 
-# ---------- MAIN FLOW ----------
+# ---------------------- MAIN FLOW ----------------------
 
 def main():
     ensure_dirs()
@@ -245,9 +311,10 @@ def main():
     write_last_url(pdf_url)
     print(f"Saved to: {pdf_path}")
 
-    # Extract row with IE07 from the PDF
+    # Extract IE07 row from PDF
     row = extract_row_ie07(pdf_path)
-    # Convert Basic Price to thousands
+
+    # Convert Basic Price to thousands (e.g., 268250 -> 268.250)
     thousands = to_thousands(row["Basic Price"])
     if thousands is None:
         raise RuntimeError(f"Could not parse numeric price from: {row['Basic Price']!r}")
@@ -255,7 +322,7 @@ def main():
 
     # Circular date: from filename (fallback to today)
     row["Circular Date"] = parse_circular_date_from_filename(pdf_path)
-    # Circular link: use the final chosen URL
+    # Link: the PDF URL used
     row["Circular Link"] = pdf_url
 
     append_to_excel(EXCEL_FILE, row)
