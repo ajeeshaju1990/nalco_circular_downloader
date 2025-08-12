@@ -5,9 +5,10 @@ from bs4 import BeautifulSoup
 import pdfplumber
 import pandas as pd
 
-from openpyxl import load_workbook
-from openpyxl.styles import Alignment, numbers
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
+from zoneinfo import ZoneInfo
 
 # ---------------------- CONFIG ----------------------
 
@@ -16,6 +17,7 @@ PDF_DIR = pathlib.Path("pdfs")
 DATA_DIR = pathlib.Path("data")
 LOG_FILE = DATA_DIR / "latest_nalco_pdf.txt"
 EXCEL_FILE = DATA_DIR / "nalco_prices.xlsx"
+RUNLOG_FILE = DATA_DIR / "nalco_run_log.xlsx"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -193,17 +195,11 @@ def to_thousands(value_str: str) -> float:
 
 def sort_and_format_df(df: pd.DataFrame) -> pd.DataFrame:
     """Sort by Circular Date (desc) for display. Keep Basic Price numeric (3 decimals)."""
-    # Parse and store temp date for sorting
     dtd = pd.to_datetime(df["Circular Date"], dayfirst=True, errors="coerce")
     df = df.assign(_date=dtd)
-
-    # Sort: latest date first; if tie, smaller Sl.no. first
     df = df.sort_values(by=["_date", "Sl.no."], ascending=[False, True], kind="stable").drop(columns=["_date"])
-
-    # Normalize types/format
     df["Basic Price"] = pd.to_numeric(df["Basic Price"], errors="coerce").round(3)
     df["Circular Date"] = pd.to_datetime(df["Circular Date"], dayfirst=True, errors="coerce").dt.strftime("%d-%m-%Y")
-
     return df
 
 def save_excel_formatted(df: pd.DataFrame, path: pathlib.Path):
@@ -211,27 +207,22 @@ def save_excel_formatted(df: pd.DataFrame, path: pathlib.Path):
     Save df to Excel, auto-fit column widths based on content,
     center-align all cells, and make Circular Link clickable.
     """
-    # Write with pandas first
     df.to_excel(path, index=False)
 
-    # Open with openpyxl to format
     wb = load_workbook(path)
     ws = wb.active
 
-    # Center alignment for all cells
     center = Alignment(horizontal="center", vertical="center")
 
-    # Determine max width for each column (header + data)
+    # Auto width
     for col_idx, col_name in enumerate(df.columns, start=1):
         max_len = len(str(col_name))
         for val in df[col_name].astype(str).values:
             if val is None:
                 continue
             max_len = max(max_len, len(val))
-        # add a little padding
         ws.column_dimensions[get_column_letter(col_idx)].width = max(10, min(max_len + 2, 80))
 
-    # Apply center alignment + number format for Basic Price
     header_row = 1
     nrows = ws.max_row
     ncols = ws.max_column
@@ -242,37 +233,29 @@ def save_excel_formatted(df: pd.DataFrame, path: pathlib.Path):
         for c in range(1, ncols + 1):
             cell = ws.cell(row=r, column=c)
             cell.alignment = center
-            # Number format for price column (3 decimals) for data rows
             if r > header_row and c == price_col_idx:
                 cell.number_format = "0.000"
-            # Hyperlink for Circular Link data rows
             if r > header_row and c == link_col_idx:
                 val = cell.value
                 if isinstance(val, str) and val.startswith("http"):
                     cell.hyperlink = val
-                    # keep text as is; Excel will show it as clickable
 
-    # Freeze header
     ws.freeze_panes = "A2"
-
     wb.save(path)
 
-def append_to_excel(excel_path: pathlib.Path, row: dict):
+def append_to_excel(excel_path: pathlib.Path, row: dict) -> int:
     """
     Append a row, assign next Sl.no. based on existing max (robust even after sorting),
     then sort by Circular Date (desc) before saving with formatting.
+    Returns total rows after append.
     """
     if excel_path.exists():
         df = pd.read_excel(excel_path, dtype={"Sl.no.": "Int64"})
-        # ensure expected columns
         for c in EXCEL_COLS:
             if c not in df.columns:
                 df[c] = pd.NA
         df = df[EXCEL_COLS]
-        if df["Sl.no."].notna().any():
-            next_slno = int(df["Sl.no."].max()) + 1
-        else:
-            next_slno = 1
+        next_slno = int(df["Sl.no."].max()) + 1 if df["Sl.no."].notna().any() else 1
     else:
         df = pd.DataFrame(columns=EXCEL_COLS)
         next_slno = 1
@@ -289,24 +272,87 @@ def append_to_excel(excel_path: pathlib.Path, row: dict):
     df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
     df = sort_and_format_df(df)
     save_excel_formatted(df, excel_path)
+    return df.shape[0]
+
+# ---------------------- RUN LOG HELPERS ----------------------
+
+def append_runlog(log_path: pathlib.Path, info: dict):
+    """
+    Append (or create) a run log Excel separate from the main data file.
+    Columns: Run UTC, Run IST, Status, Message, Chosen URL, Saved PDF, Rows Appended, Total Rows After
+    """
+    cols = ["Run UTC", "Run IST", "Status", "Message", "Chosen URL", "Saved PDF", "Rows Appended", "Total Rows After"]
+    if log_path.exists():
+        df = pd.read_excel(log_path)
+        for c in cols:
+            if c not in df.columns:
+                df[c] = pd.NA
+        df = df[cols]
+    else:
+        df = pd.DataFrame(columns=cols)
+
+    df = pd.concat([df, pd.DataFrame([{
+        "Run UTC": info.get("Run UTC"),
+        "Run IST": info.get("Run IST"),
+        "Status": info.get("Status"),
+        "Message": info.get("Message"),
+        "Chosen URL": info.get("Chosen URL"),
+        "Saved PDF": info.get("Saved PDF"),
+        "Rows Appended": info.get("Rows Appended"),
+        "Total Rows After": info.get("Total Rows After"),
+    }])], ignore_index=True)
+
+    # Save & simple formatting (autofit + center)
+    df.to_excel(log_path, index=False)
+    wb = load_workbook(log_path)
+    ws = wb.active
+    center = Alignment(horizontal="center", vertical="center")
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        max_len = len(str(col_name))
+        for val in df[col_name].astype(str).values:
+            max_len = max(max_len, len(val))
+        ws.column_dimensions[get_column_letter(col_idx)].width = max(10, min(max_len + 2, 100))
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            ws.cell(row=r, column=c).alignment = center
+    ws.freeze_panes = "A2"
+    wb.save(log_path)
+
+def now_times():
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+    return now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"), now_ist.strftime("%Y-%m-%d %H:%M:%S IST")
 
 # ---------------------- MAIN FLOW ----------------------
 
 def main():
     ensure_dirs()
+    run_utc, run_ist = now_times()
+
     html = get_html(NALCO_URL)
     pdf_url = find_ingots_pdf_url(html)
     if not pdf_url:
-        print("No Ingots PDF link found on the page.", file=sys.stderr)
+        msg = "No Ingots PDF link found on the page."
+        print(msg, file=sys.stderr)
+        append_runlog(RUNLOG_FILE, {
+            "Run UTC": run_utc, "Run IST": run_ist, "Status": "SKIPPED",
+            "Message": msg, "Chosen URL": "", "Saved PDF": "", "Rows Appended": 0, "Total Rows After": ""
+        })
         sys.exit(1)
 
     print(f"Chosen PDF URL: {pdf_url}")
 
     last = read_last_url()
     if pdf_url == last:
-        print("No change in PDF. Skipping download & Excel update.")
+        msg = "No change in PDF. Skipping download & Excel update."
+        print(msg)
+        append_runlog(RUNLOG_FILE, {
+            "Run UTC": run_utc, "Run IST": run_ist, "Status": "SKIPPED",
+            "Message": msg, "Chosen URL": pdf_url, "Saved PDF": "", "Rows Appended": 0, "Total Rows After": ""
+        })
         return
 
+    # New circular
     pdf_path = download_pdf(pdf_url)
     write_last_url(pdf_url)
     print(f"Saved to: {pdf_path}")
@@ -325,8 +371,14 @@ def main():
     # Link: the PDF URL used
     row["Circular Link"] = pdf_url
 
-    append_to_excel(EXCEL_FILE, row)
+    total_rows = append_to_excel(EXCEL_FILE, row)
     print(f"Excel updated: {EXCEL_FILE}")
+
+    append_runlog(RUNLOG_FILE, {
+        "Run UTC": run_utc, "Run IST": run_ist, "Status": "UPDATED",
+        "Message": "New circular processed.", "Chosen URL": pdf_url,
+        "Saved PDF": pdf_path.name, "Rows Appended": 1, "Total Rows After": total_rows
+    })
 
 if __name__ == "__main__":
     main()
