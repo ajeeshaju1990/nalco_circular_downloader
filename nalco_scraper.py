@@ -11,10 +11,13 @@ from openpyxl.utils import get_column_letter
 from zoneinfo import ZoneInfo
 
 # ---------------------- CONFIG ----------------------
+# Make all outputs relative to a base dir (defaults to current dir).
+# This keeps behavior identical locally and on GitHub Actions.
+BASE_DIR = pathlib.Path(os.getenv("BASE_DIR", ".")).resolve()
 
 NALCO_URL = "https://nalcoindia.com/domestic/current-price/"
-PDF_DIR = pathlib.Path("pdfs")
-DATA_DIR = pathlib.Path("data")
+PDF_DIR = (BASE_DIR / "pdfs")
+DATA_DIR = (BASE_DIR / "data")
 LOG_FILE = DATA_DIR / "latest_nalco_pdf.txt"
 EXCEL_FILE = DATA_DIR / "nalco_prices.xlsx"
 RUNLOG_FILE = DATA_DIR / "nalco_run_log.xlsx"
@@ -29,7 +32,6 @@ DATEY_PDF_RE = re.compile(r"Ingot-(\d{2})-(\d{2})-(\d{4})\.pdf$", re.IGNORECASE)
 EXCEL_COLS = ["Sl.no.", "Description", "Product Code", "Basic Price", "Circular Date", "Circular Link"]
 
 # ---------------------- SCRAPER UTILS ----------------------
-
 def ensure_dirs():
     for p in (PDF_DIR, DATA_DIR):
         if p.exists() and p.is_file():
@@ -104,7 +106,6 @@ def download_pdf(url):
         return dest
 
 # ---------------------- PDF PARSING ----------------------
-
 def parse_circular_date_from_filename(pdf_path: pathlib.Path) -> str:
     """Extract DD-MM-YYYY from 'Ingot-DD-MM-YYYY.pdf', else use today."""
     m = DATEY_PDF_RE.search(pdf_path.name)
@@ -192,7 +193,6 @@ def to_thousands(value_str: str) -> float:
         return None
 
 # ---------------------- EXCEL HELPERS ----------------------
-
 def sort_and_format_df(df: pd.DataFrame) -> pd.DataFrame:
     """Sort by Circular Date (desc) for display. Keep Basic Price numeric (3 decimals)."""
     dtd = pd.to_datetime(df["Circular Date"], dayfirst=True, errors="coerce")
@@ -275,7 +275,6 @@ def append_to_excel(excel_path: pathlib.Path, row: dict) -> int:
     return df.shape[0]
 
 # ---------------------- RUN LOG HELPERS ----------------------
-
 def append_runlog(log_path: pathlib.Path, info: dict):
     """
     Append (or create) a run log Excel separate from the main data file.
@@ -324,7 +323,6 @@ def now_times():
     return now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"), now_ist.strftime("%Y-%m-%d %H:%M:%S IST")
 
 # ---------------------- MAIN FLOW ----------------------
-
 def main():
     ensure_dirs()
     run_utc, run_ist = now_times()
