@@ -9,14 +9,27 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: nalco-pdf-downloader
+  cancel-in-progress: true
+
+env:
+  OUTPUT_DIR: nalco_downloads
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: nalco_circular_downloader
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           persist-credentials: true
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,13 +39,38 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests beautifulsoup4 lxml
+          fi
+
+      - name: Ensure output directory exists
+        run: mkdir -p "$OUTPUT_DIR"
 
       - name: Run scraper
+        env:
+          OUTPUT_DIR: ${{ env.OUTPUT_DIR }}
         run: |
+          echo "Running nalco_scraper.py in $(pwd); OUTPUT_DIR=$OUTPUT_DIR"
           python nalco_scraper.py
 
-      - name: Commit & push if changed
+      - name: List output directory
+        run: |
+          echo "PWD: $(pwd)"
+          echo "Listing $OUTPUT_DIR:"
+          ls -la "$OUTPUT_DIR" || true
+
+      - name: Upload PDF artifact (if any)
+        if: ${{ hashFiles(format('{0}/*.pdf', env.OUTPUT_DIR)) != '' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: nalco-pdf
+          path: ${{ env.OUTPUT_DIR }}/*.pdf
+          if-no-files-found: ignore
+
+      - name: Commit & push if changed (repo root)
+        working-directory: .
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
