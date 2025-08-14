@@ -14,12 +14,14 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  OUTPUT_DIR: nalco_downloads
+  # Not strictly needed by the script, but handy for future; we run inside this folder.
+  BASE_DIR: .
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
 
+    # Run all shell steps inside the code folder
     defaults:
       run:
         working-directory: nalco_circular_downloader
@@ -42,33 +44,40 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install requests beautifulsoup4 lxml
+            pip install requests beautifulsoup4 lxml pdfplumber pandas openpyxl
           fi
 
-      - name: Ensure output directory exists
-        run: mkdir -p "$OUTPUT_DIR"
+      - name: Ensure output directories exist
+        run: |
+          mkdir -p pdfs
+          mkdir -p data
 
       - name: Run scraper
         env:
-          OUTPUT_DIR: ${{ env.OUTPUT_DIR }}
+          BASE_DIR: ${{ env.BASE_DIR }}
         run: |
-          echo "Running nalco_scraper.py in $(pwd); OUTPUT_DIR=$OUTPUT_DIR"
+          echo "Running nalco_scraper.py in $(pwd)"
           python nalco_scraper.py
+          echo "Scraper finished."
 
-      - name: List output directory
+      - name: List outputs
         run: |
           echo "PWD: $(pwd)"
-          echo "Listing $OUTPUT_DIR:"
-          ls -la "$OUTPUT_DIR" || true
+          echo "--- pdfs/"
+          ls -la pdfs || true
+          echo "--- data/"
+          ls -la data || true
 
+      # Upload artifact only if at least one PDF exists (prevents 'missing download info' issue)
       - name: Upload PDF artifact (if any)
-        if: ${{ hashFiles(format('{0}/*.pdf', env.OUTPUT_DIR)) != '' }}
+        if: ${{ hashFiles('nalco_circular_downloader/pdfs/*.pdf') != '' }}
         uses: actions/upload-artifact@v3
         with:
           name: nalco-pdf
-          path: ${{ env.OUTPUT_DIR }}/*.pdf
+          path: nalco_circular_downloader/pdfs/*.pdf
           if-no-files-found: ignore
 
+      # Commit & push changes (Excel/log/PDFs) if repo content changed
       - name: Commit & push if changed (repo root)
         working-directory: .
         run: |
