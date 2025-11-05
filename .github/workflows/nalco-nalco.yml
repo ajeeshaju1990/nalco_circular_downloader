@@ -68,10 +68,10 @@ jobs:
           echo "--- data/"
           ls -la data || true
 
-      # Upload artifacts only if they exist (prevents 'missing download info' issues)
+      # Upload artifacts only if they exist (prevents failures when nothing is produced)
       - name: Upload PDF artifacts (if any)
         if: ${{ hashFiles('nalco_circular_downloader/pdfs/*.pdf') != '' }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: nalco-pdfs
           path: nalco_circular_downloader/pdfs/*.pdf
@@ -79,7 +79,7 @@ jobs:
 
       - name: Upload Excel artifact (if exists)
         if: ${{ hashFiles('nalco_circular_downloader/data/nalco_prices.xlsx') != '' }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: nalco-prices-xlsx
           path: nalco_circular_downloader/data/nalco_prices.xlsx
