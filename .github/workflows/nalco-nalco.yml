@@ -1,5 +1,9 @@
 name: Nalco PDF downloader
 
+# give the GITHUB_TOKEN permission to write repo contents so the workflow can push
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -55,7 +59,6 @@ jobs:
           if [ "$REPAIR" = "true" ]; then
             ARGS+=("--repair")
           fi
-          # pass page url if provided
           if [ -n "${NALCO_PAGE_URL}" ]; then
             ARGS+=("--page-url" "${NALCO_PAGE_URL}")
           fi
@@ -67,6 +70,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add pdfs data/nalco_prices.xlsx || true
-          # create an allow-empty commit so we always have a commit even if there are no staged changes
-          git commit -m "Update Nalco PDFs and data" --allow-empty
+          git commit -m "Update Nalco PDFs and data" --allow-empty || true
           git push
