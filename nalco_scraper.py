@@ -1,130 +1,124 @@
-import os, sys, time, pathlib, re, requests, datetime
+import os, re, json, pathlib, datetime, argparse
+import requests
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 import pdfplumber
 import pandas as pd
-
-from openpyxl import load_workbook, Workbook
+from openpyxl import load_workbook
 from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
-from zoneinfo import ZoneInfo
 
-# ---------------------- CONFIG ----------------------
+# ---------------- CONFIG ----------------
+START_URL = "https://nalcoindia.com/domestic/current-price/"
 
-NALCO_URL = "https://nalcoindia.com/domestic/current-price/"
-PDF_DIR = pathlib.Path("pdfs")
+PDF_DIR  = pathlib.Path("pdfs")
 DATA_DIR = pathlib.Path("data")
-LOG_FILE = DATA_DIR / "latest_nalco_pdf.txt"
-EXCEL_FILE = DATA_DIR / "nalco_prices.xlsx"
-RUNLOG_FILE = DATA_DIR / "nalco_run_log.xlsx"
+PDF_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+LATEST_JSON         = DATA_DIR / "latest_nalco_pdf.json"     # {last_pdf_url, download_timestamp, filename}
+LAST_PROCESSED_FILE = DATA_DIR / "last_nalco_processed.txt"  # last processed filename (avoid double-parse)
+PROCESSED_SET_FILE  = DATA_DIR / "processed_nalco_files.txt" # set of processed filenames (for backfill)
+EXCEL_FILE          = DATA_DIR / "nalco_prices.xlsx"
+
+# DAILY columns we will maintain
+DAILY_COLUMNS = ["Date", "Description", "Product Code", "Basic Price", "Circular Date", "Circular Link"]
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-# prefer "Ingot-DD-MM-YYYY.pdf" and exclude spec docs
-DATEY_PDF_RE = re.compile(r"Ingot-(\d{2})-(\d{2})-(\d{4})\.pdf$", re.IGNORECASE)
+# Nalco filenames look like .../Ingot-07-08-2025.pdf
+FILENAME_DATE_NUMERIC = re.compile(r"(\d{1,2})[-_/\.](\d{1,2})[-_/\.](\d{4})")
 
-# Final Excel column order
-EXCEL_COLS = ["Sl.no.", "Description", "Product Code", "Basic Price", "Circular Date", "Circular Link"]
-
-# ---------------------- SCRAPER UTILS ----------------------
-
-def ensure_dirs():
-    for p in (PDF_DIR, DATA_DIR):
-        if p.exists() and p.is_file():
-            p.unlink()
-        p.mkdir(parents=True, exist_ok=True)
-
-def get_html(url):
+# ---------------- HTML & DOWNLOAD ----------------
+def get_html(url: str) -> str:
     r = requests.get(url, headers={"User-Agent": UA}, timeout=60)
     r.raise_for_status()
     return r.text
 
-def norm(s: str) -> str:
-    return (s or "").strip().lower()
-
-def find_ingots_pdf_url(html):
+def find_ingots_pdf_url(html: str) -> str | None:
+    """
+    Find the anchor for Ingots:
+      <a href="https://.../Ingot-07-08-2025.pdf"><img ...><p>Ingots</p></a>
+    """
     soup = BeautifulSoup(html, "html.parser")
-
-    # STRICT: <a ...><img ...><p>Ingots</p></a>
-    for pnode in soup.find_all("p"):
-        if norm(pnode.get_text()) == "ingots":
-            a = pnode.find_parent("a", href=True)
-            if a:
-                href = a["href"].strip()
-                if href.lower().endswith(".pdf") and "spec" not in href.lower():
-                    return urljoin(NALCO_URL, href)
-
-    # Prefer filenames like Ingot-DD-MM-YYYY.pdf (exclude spec)
+    for a in soup.find_all("a", href=True):
+        text = (a.get_text(" ", strip=True) or "").lower()
+        href = a["href"].strip()
+        if "ingot" in href.lower() and href.lower().endswith(".pdf"):
+            # prefer ones whose inner <p> contains "Ingots"
+            if any((t.strip().lower() == "ingots") for t in a.stripped_strings):
+                return urljoin(START_URL, href)
+    # fallback: any PDF whose name contains "ingot"
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-        if href.lower().endswith(".pdf") and "spec" not in href.lower():
-            if DATEY_PDF_RE.search(href):
-                return urljoin(NALCO_URL, href)
-
-    # Fallback: any PDF link whose anchor text mentions "ingot" (not spec)
-    for a in soup.find_all("a", href=True):
-        txt = norm(a.get_text())
-        href = a["href"].strip()
-        if href.lower().endswith(".pdf") and "ingot" in txt and "spec" not in href.lower():
-            return urljoin(NALCO_URL, href)
-
+        if "ingot" in href.lower() and href.lower().endswith(".pdf"):
+            return urljoin(START_URL, href)
     return None
 
-def read_last_url():
-    return LOG_FILE.read_text(encoding="utf-8").strip() if LOG_FILE.exists() else ""
-
-def write_last_url(url):
-    LOG_FILE.write_text(url or "", encoding="utf-8")
-
-def download_pdf(url):
-    headers = {
-        "User-Agent": UA,
-        "Referer": NALCO_URL,
-        "Accept": "application/pdf,*/*;q=0.9",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    with requests.get(url, headers=headers, timeout=60, stream=True, allow_redirects=True) as r:
-        r.raise_for_status()
-        ctype = r.headers.get("Content-Type", "").lower()
-        if "application/pdf" not in ctype:
-            raise RuntimeError(f"Expected PDF but got Content-Type={ctype!r} from {url}")
-        filename = None
-        cd = r.headers.get("Content-Disposition", "")
-        if "filename=" in cd:
-            filename = cd.split("filename=", 1)[1].strip('"; ')
-        if not filename:
-            filename = os.path.basename(urlparse(r.url).path) or f"nalco_{int(time.time())}.pdf"
-        dest = PDF_DIR / filename
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=65536):
-                if chunk:
-                    f.write(chunk)
-        return dest
-
-# ---------------------- PDF PARSING ----------------------
-
-def parse_circular_date_from_filename(pdf_path: pathlib.Path) -> str:
-    """Extract DD-MM-YYYY from 'Ingot-DD-MM-YYYY.pdf', else use today."""
-    m = DATEY_PDF_RE.search(pdf_path.name)
-    if m:
-        dd, mm, yyyy = m.groups()
+def read_latest_json() -> dict:
+    if LATEST_JSON.exists():
         try:
-            d = datetime.date(int(yyyy), int(mm), int(dd))
-            return d.strftime("%d-%m-%Y")
-        except ValueError:
-            pass
-    return datetime.date.today().strftime("%d-%m-%Y")
+            return json.loads(LATEST_JSON.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
 
-def extract_row_ie07(pdf_path: pathlib.Path):
+def write_latest_json(pdf_url: str, filename: str):
+    obj = {
+        "last_pdf_url": pdf_url,
+        "download_timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "filename": filename
+    }
+    LATEST_JSON.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+
+def download_pdf(pdf_url: str) -> pathlib.Path:
+    headers = {"User-Agent": UA, "Accept": "application/pdf,*/*;q=0.9", "Referer": START_URL}
+    with requests.get(pdf_url, headers=headers, timeout=60, stream=True, allow_redirects=True) as r:
+        r.raise_for_status()
+        if "application/pdf" not in (r.headers.get("Content-Type","").lower()):
+            raise RuntimeError(f"Expected PDF but got {r.headers.get('Content-Type')}")
+        name = os.path.basename(urlparse(r.url).path) or "Ingots.pdf"
+        timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        fname = f"{timestamp}_{name}"
+        dest = PDF_DIR / fname
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(65536):
+                if chunk: f.write(chunk)
+    return dest
+
+# ---------------- PDF PARSE (Nalco IE07) ----------------
+def parse_date_from_filename(filename: str) -> str:
     """
-    Find the row that contains 'IE07'.
-    Returns dict: { 'Description', 'Product Code', 'Basic Price' }
+    Extract dd.mm.yyyy from Ingot-07-08-2025.pdf (or similar)
+    """
+    m = FILENAME_DATE_NUMERIC.search(filename)
+    if not m:
+        return datetime.date.today().strftime("%d.%m.%Y")
+    d, mth, y = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    try:
+        dt = datetime.date(y, mth, d)
+        return dt.strftime("%d.%m.%Y")
+    except ValueError:
+        return datetime.date.today().strftime("%d.%m.%Y")
+
+def divide_thousands(x: str | float | int) -> float | None:
+    s = str(x).replace(",", "").strip()
+    if not s: return None
+    try: return round(float(s)/1000.0, 3)
+    except ValueError: return None
+
+def extract_ie07_row(pdf_path: pathlib.Path) -> tuple[str, str, str]:
+    """
+    Return (description, product_code, raw_price) for the row containing IE07.
+    Nalco table typically:
+      Col2: Description (e.g., ALUMINIUM INGOT)
+      Col3: Product Code (IE07)
+      Col4: Basic Price (e.g., 268250)
     """
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            # Try structured tables
             try:
                 tables = page.extract_tables()
             except Exception:
@@ -132,253 +126,248 @@ def extract_row_ie07(pdf_path: pathlib.Path):
             for tbl in tables or []:
                 for row in tbl:
                     cells = [(c or "").strip() for c in row]
-                    if any(re.fullmatch(r"IE07", x, flags=re.IGNORECASE) for x in cells):
-                        desc = ""
-                        code = "IE07"
-                        price = ""
-                        idx_code = None
-                        for i, c in enumerate(cells):
-                            if re.fullmatch(r"IE07", c, flags=re.IGNORECASE):
-                                idx_code = i
-                                break
-                        if idx_code is not None:
-                            # description: look left for non-numeric text
-                            for j in range(idx_code - 1, -1, -1):
-                                if cells[j] and not re.fullmatch(r"\d+(\.\d+)?", cells[j]):
+                    upper = [c.upper() for c in cells]
+                    if any("IE07" in u for u in upper):
+                        # try to map: [*, Description, ProductCode, Price, ...]
+                        desc = None
+                        code = None
+                        price = None
+                        # A simple heuristic: pick first string cell as desc (after any S.No), next token containing IE07 as code, last numeric-looking as price
+                        # Better: attempt column-based pattern
+                        #  - find the cell containing IE07
+                        code_idx = next((i for i, u in enumerate(upper) if "IE07" in u), None)
+                        if code_idx is not None:
+                            code = cells[code_idx]
+                            # description likely sits before code, price likely after
+                            # find last numeric cell to the right
+                            for j in range(len(cells)-1, -1, -1):
+                                if re.search(r"\d", cells[j]):
+                                    price = cells[j].replace(",", "").strip()
+                                    break
+                            # find the closest non-empty text to the left as description
+                            for j in range(code_idx-1, -1, -1):
+                                if cells[j]:
                                     desc = cells[j]
                                     break
-                            # price: first numeric-looking to right
-                            for j in range(idx_code + 1, len(cells)):
-                                if re.search(r"\d", cells[j]):
-                                    price = cells[j].replace(",", "")
+                        # Fallbacks
+                        if not desc:
+                            # try the longest text cell as desc
+                            desc = max(cells, key=lambda c: len(c)) if cells else ""
+                        if not price:
+                            # scan any numeric token
+                            for c in reversed(cells):
+                                if re.search(r"\d", c):
+                                    price = c.replace(",", "").strip()
                                     break
-                        if code and price:
-                            return {
-                                "Description": (desc or "ALUMINIUM INGOT").upper(),
-                                "Product Code": code,
-                                "Basic Price": price
-                            }
+                        return (desc or "").strip(), (code or "IE07").strip(), (price or "").strip()
+    raise RuntimeError(f"Could not find IE07 row in: {pdf_path.name}")
 
-            # Fallback: line text scan
-            words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
-            lines = {}
-            for w in words:
-                y = round(w["top"], 1)
-                lines.setdefault(y, []).append(w)
-            for y, wlist in lines.items():
-                text_line = " ".join([w["text"] for w in sorted(wlist, key=lambda x: x["x0"])])
-                if re.search(r"\bIE07\b", text_line, flags=re.IGNORECASE):
-                    m_price = re.search(r"(\d{5,7}(?:\.\d+)?)\s*$", text_line)
-                    price = (m_price.group(1) if m_price else "").replace(",", "")
-                    m_desc = re.search(r"([A-Z ]*INGOT[A-Z ]*)\b", text_line, flags=re.IGNORECASE)
-                    desc = (m_desc.group(1) if m_desc else "ALUMINIUM INGOT").strip().upper()
-                    if price:
-                        return {
-                            "Description": desc,
-                            "Product Code": "IE07",
-                            "Basic Price": price
-                        }
-    raise RuntimeError("Could not find a row with Product Code IE07 in the PDF.")
-
-def to_thousands(value_str: str) -> float:
-    """Convert raw price (e.g., '268250') to thousands (e.g., 268.250)."""
-    value_str = value_str.replace(",", "").strip()
-    if not value_str:
-        return None
+# ---------------- EVENT/DATES HELPERS ----------------
+def _to_dt_dot(s: str) -> datetime.date | None:
     try:
-        v = float(value_str)
-        return round(v / 1000.0, 3)
-    except ValueError:
+        return datetime.datetime.strptime(s, "%d.%m.%Y").date()
+    except Exception:
         return None
 
-# ---------------------- EXCEL HELPERS ----------------------
+def _fmt_date_dash(d: datetime.date) -> str:
+    return d.strftime("%d-%m-%Y")  # Date column
 
-def sort_and_format_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Sort by Circular Date (desc) for display. Keep Basic Price numeric (3 decimals)."""
-    dtd = pd.to_datetime(df["Circular Date"], dayfirst=True, errors="coerce")
-    df = df.assign(_date=dtd)
-    df = df.sort_values(by=["_date", "Sl.no."], ascending=[False, True], kind="stable").drop(columns=["_date"])
-    df["Basic Price"] = pd.to_numeric(df["Basic Price"], errors="coerce").round(3)
-    df["Circular Date"] = pd.to_datetime(df["Circular Date"], dayfirst=True, errors="coerce").dt.strftime("%d-%m-%Y")
-    return df
+def _fmt_date_dot(d: datetime.date) -> str:
+    return d.strftime("%d.%m.%Y")  # Circular Date column
 
+def load_events_from_excel_if_any() -> list[dict]:
+    """
+    Read current Excel and collapse to unique circular events:
+      - If old 'Sl.no.' format -> take each row as an event.
+      - If already daily -> keep last per Circular Date.
+    Each event: {desc, code, price, cdate (date), clink}
+    """
+    if not EXCEL_FILE.exists():
+        return []
+    df = pd.read_excel(EXCEL_FILE)
+    cols = [c.strip() for c in df.columns]
+
+    if "Sl.no." in cols:
+        # Old format: ["Sl.no.","Description","Product Code","Basic Price","Circular Date","Circular Link"]
+        keep = ["Description","Product Code","Basic Price","Circular Date","Circular Link"]
+        for k in keep:
+            if k not in df.columns: df[k] = pd.NA
+        ev = df[keep].copy()
+    else:
+        # Already daily: collapse to last entry per Circular Date
+        keep = ["Description","Product Code","Basic Price","Circular Date","Circular Link"]
+        for k in keep:
+            if k not in df.columns: df[k] = pd.NA
+        ev = df[keep].copy()
+        ev = ev.sort_values(by="Circular Date").drop_duplicates(subset=["Circular Date"], keep="last")
+
+    ev["Basic Price"] = pd.to_numeric(ev["Basic Price"], errors="coerce")
+    ev["Circular Date DT"] = ev["Circular Date"].apply(_to_dt_dot)
+    ev = ev.dropna(subset=["Circular Date DT"]).sort_values("Circular Date DT")
+
+    events = []
+    for _, r in ev.iterrows():
+        events.append({
+            "desc": r.get("Description", "") or "",
+            "code": r.get("Product Code", "") or "IE07",
+            "price": float(r.get("Basic Price")) if pd.notna(r.get("Basic Price")) else None,
+            "cdate": r["Circular Date DT"],
+            "clink": r.get("Circular Link", "") or "",
+        })
+    return events
+
+def add_event(events: list[dict], desc: str, code: str, price: float, circular_date_str: str, link: str):
+    dt = _to_dt_dot(circular_date_str)
+    if not dt: return events
+    # replace any same-date event with newer info
+    events = [e for e in events if e["cdate"] != dt]
+    events.append({"desc": desc, "code": code or "IE07", "price": price, "cdate": dt, "clink": link or ""})
+    events.sort(key=lambda e: e["cdate"])
+    return events
+
+def build_daily_from_events(events: list[dict], end_date: datetime.date | None = None) -> pd.DataFrame:
+    if not events:
+        return pd.DataFrame(columns=DAILY_COLUMNS)
+    events = sorted(events, key=lambda e: e["cdate"])
+    start = events[0]["cdate"]
+    today = end_date or datetime.date.today()
+    if start > today:
+        start = today
+
+    rows = []
+    idx = 0
+    current = events[0]
+    for d in (start + datetime.timedelta(n) for n in range((today - start).days + 1)):
+        while idx + 1 < len(events) and events[idx + 1]["cdate"] <= d:
+            idx += 1
+            current = events[idx]
+        rows.append({
+            "Date": _fmt_date_dash(d),
+            "Description": current["desc"],
+            "Product Code": current["code"] or "IE07",
+            "Basic Price": round(float(current["price"]), 3) if current["price"] is not None else None,
+            "Circular Date": _fmt_date_dot(current["cdate"]),
+            "Circular Link": current["clink"],
+        })
+    df = pd.DataFrame(rows)
+    df["DateDT"] = pd.to_datetime(df["Date"], format="%d-%m-%Y", errors="coerce")
+    df = df.sort_values(by="DateDT", ascending=False).drop(columns=["DateDT"])
+    return df[DAILY_COLUMNS]
+
+# ---------------- WRITE EXCEL ----------------
 def save_excel_formatted(df: pd.DataFrame, path: pathlib.Path):
-    """
-    Save df to Excel, auto-fit column widths based on content,
-    center-align all cells, and make Circular Link clickable.
-    """
     df.to_excel(path, index=False)
-
-    wb = load_workbook(path)
-    ws = wb.active
-
+    wb = load_workbook(path); ws = wb.active
     center = Alignment(horizontal="center", vertical="center")
-
-    # Auto width
-    for col_idx, col_name in enumerate(df.columns, start=1):
-        max_len = len(str(col_name))
-        for val in df[col_name].astype(str).values:
-            if val is None:
-                continue
-            max_len = max(max_len, len(val))
-        ws.column_dimensions[get_column_letter(col_idx)].width = max(10, min(max_len + 2, 80))
-
-    header_row = 1
-    nrows = ws.max_row
-    ncols = ws.max_column
-    price_col_idx = EXCEL_COLS.index("Basic Price") + 1
-    link_col_idx = EXCEL_COLS.index("Circular Link") + 1
-
-    for r in range(1, nrows + 1):
-        for c in range(1, ncols + 1):
-            cell = ws.cell(row=r, column=c)
-            cell.alignment = center
-            if r > header_row and c == price_col_idx:
-                cell.number_format = "0.000"
-            if r > header_row and c == link_col_idx:
-                val = cell.value
-                if isinstance(val, str) and val.startswith("http"):
-                    cell.hyperlink = val
-
-    ws.freeze_panes = "A2"
-    wb.save(path)
-
-def append_to_excel(excel_path: pathlib.Path, row: dict) -> int:
-    """
-    Append a row, assign next Sl.no. based on existing max (robust even after sorting),
-    then sort by Circular Date (desc) before saving with formatting.
-    Returns total rows after append.
-    """
-    if excel_path.exists():
-        df = pd.read_excel(excel_path, dtype={"Sl.no.": "Int64"})
-        for c in EXCEL_COLS:
-            if c not in df.columns:
-                df[c] = pd.NA
-        df = df[EXCEL_COLS]
-        next_slno = int(df["Sl.no."].max()) + 1 if df["Sl.no."].notna().any() else 1
-    else:
-        df = pd.DataFrame(columns=EXCEL_COLS)
-        next_slno = 1
-
-    new_row = {
-        "Sl.no.": next_slno,
-        "Description": row["Description"],
-        "Product Code": row["Product Code"],
-        "Basic Price": row["Basic Price"],    # already divided by 1000 upstream
-        "Circular Date": row["Circular Date"],
-        "Circular Link": row["Circular Link"],
-    }
-
-    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-    df = sort_and_format_df(df)
-    save_excel_formatted(df, excel_path)
-    return df.shape[0]
-
-# ---------------------- RUN LOG HELPERS ----------------------
-
-def append_runlog(log_path: pathlib.Path, info: dict):
-    """
-    Append (or create) a run log Excel separate from the main data file.
-    Columns: Run UTC, Run IST, Status, Message, Chosen URL, Saved PDF, Rows Appended, Total Rows After
-    """
-    cols = ["Run UTC", "Run IST", "Status", "Message", "Chosen URL", "Saved PDF", "Rows Appended", "Total Rows After"]
-    if log_path.exists():
-        df = pd.read_excel(log_path)
-        for c in cols:
-            if c not in df.columns:
-                df[c] = pd.NA
-        df = df[cols]
-    else:
-        df = pd.DataFrame(columns=cols)
-
-    df = pd.concat([df, pd.DataFrame([{
-        "Run UTC": info.get("Run UTC"),
-        "Run IST": info.get("Run IST"),
-        "Status": info.get("Status"),
-        "Message": info.get("Message"),
-        "Chosen URL": info.get("Chosen URL"),
-        "Saved PDF": info.get("Saved PDF"),
-        "Rows Appended": info.get("Rows Appended"),
-        "Total Rows After": info.get("Total Rows After"),
-    }])], ignore_index=True)
-
-    # Save & simple formatting (autofit + center)
-    df.to_excel(log_path, index=False)
-    wb = load_workbook(log_path)
-    ws = wb.active
-    center = Alignment(horizontal="center", vertical="center")
-    for col_idx, col_name in enumerate(df.columns, start=1):
-        max_len = len(str(col_name))
-        for val in df[col_name].astype(str).values:
-            max_len = max(max_len, len(val))
-        ws.column_dimensions[get_column_letter(col_idx)].width = max(10, min(max_len + 2, 100))
+    for cidx, cname in enumerate(df.columns, start=1):
+        max_len = len(str(cname))
+        for v in df[cname].astype(str).values:
+            max_len = max(max_len, len(v))
+        ws.column_dimensions[get_column_letter(cidx)].width = max(12, min(max_len + 2, 80))
+    price_col_idx = DAILY_COLUMNS.index("Basic Price") + 1
+    for r in range(2, ws.max_row + 1):
+        ws.cell(row=r, column=price_col_idx).number_format = "0.000"
     for r in range(1, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
             ws.cell(row=r, column=c).alignment = center
+    # hyperlinks
+    link_col = DAILY_COLUMNS.index("Circular Link") + 1
+    for r in range(2, ws.max_row + 1):
+        val = ws.cell(row=r, column=link_col).value
+        if isinstance(val, str) and val.startswith("http"):
+            ws.cell(row=r, column=link_col).hyperlink = val
     ws.freeze_panes = "A2"
-    wb.save(log_path)
+    wb.save(path)
 
-def now_times():
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-    now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
-    return now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"), now_ist.strftime("%Y-%m-%d %H:%M:%S IST")
+# ---------------- STATE HELPERS ----------------
+def load_processed_set() -> set[str]:
+    if PROCESSED_SET_FILE.exists():
+        return set(x.strip() for x in PROCESSED_SET_FILE.read_text(encoding="utf-8").splitlines() if x.strip())
+    return set()
 
-# ---------------------- MAIN FLOW ----------------------
+def save_processed_set(s: set[str]):
+    PROCESSED_SET_FILE.write_text("\n".join(sorted(s)), encoding="utf-8")
 
-def main():
-    ensure_dirs()
-    run_utc, run_ist = now_times()
-
-    html = get_html(NALCO_URL)
+# ---------------- MODES ----------------
+def run_normal():
+    events = load_events_from_excel_if_any()
+    html = get_html(START_URL)
     pdf_url = find_ingots_pdf_url(html)
-    if not pdf_url:
-        msg = "No Ingots PDF link found on the page."
-        print(msg, file=sys.stderr)
-        append_runlog(RUNLOG_FILE, {
-            "Run UTC": run_utc, "Run IST": run_ist, "Status": "SKIPPED",
-            "Message": msg, "Chosen URL": "", "Saved PDF": "", "Rows Appended": 0, "Total Rows After": ""
-        })
-        sys.exit(1)
+    latest = read_latest_json()
+    last_url = latest.get("last_pdf_url")
 
-    print(f"Chosen PDF URL: {pdf_url}")
+    if pdf_url and pdf_url != last_url:
+        # new circular -> download + parse + add event
+        pdf_path = download_pdf(pdf_url)
+        write_latest_json(pdf_url, str(pdf_path))
+        print(f"Downloaded: {pdf_path.name}")
 
-    last = read_last_url()
-    if pdf_url == last:
-        msg = "No change in PDF. Skipping download & Excel update."
-        print(msg)
-        append_runlog(RUNLOG_FILE, {
-            "Run UTC": run_utc, "Run IST": run_ist, "Status": "SKIPPED",
-            "Message": msg, "Chosen URL": pdf_url, "Saved PDF": "", "Rows Appended": 0, "Total Rows After": ""
-        })
-        return
+        last_name = LAST_PROCESSED_FILE.read_text(encoding="utf-8").strip() if LAST_PROCESSED_FILE.exists() else ""
+        if pdf_path.name != last_name:
+            desc, code, raw_price = extract_ie07_row(pdf_path)
+            price = divide_thousands(raw_price)
+            if price is None:
+                raise RuntimeError(f"Could not parse numeric price: {raw_price!r}")
+            cdate = parse_date_from_filename(pdf_path.name)
+            events = add_event(events, desc, code or "IE07", price, cdate, pdf_url)
+            LAST_PROCESSED_FILE.write_text(pdf_path.name, encoding="utf-8")
+            processed = load_processed_set(); processed.add(pdf_path.name); save_processed_set(processed)
+            print(f"Added event for {cdate}")
+        else:
+            print("Latest PDF already processed; skipping parse.")
+    else:
+        print("No new circular; will forward-fill daily series.")
 
-    # New circular
-    pdf_path = download_pdf(pdf_url)
-    write_last_url(pdf_url)
-    print(f"Saved to: {pdf_path}")
+    daily_df = build_daily_from_events(events, end_date=datetime.date.today())
+    save_excel_formatted(daily_df, EXCEL_FILE)
+    print(f"Wrote daily sheet with {len(daily_df)} rows → {EXCEL_FILE}")
 
-    # Extract IE07 row from PDF
-    row = extract_row_ie07(pdf_path)
+def run_backfill():
+    events = load_events_from_excel_if_any()
+    processed = load_processed_set()
+    pdfs = sorted(PDF_DIR.glob("*.pdf"), key=lambda p: p.stat().st_mtime)  # oldest→newest
 
-    # Convert Basic Price to thousands (e.g., 268250 -> 268.250)
-    thousands = to_thousands(row["Basic Price"])
-    if thousands is None:
-        raise RuntimeError(f"Could not parse numeric price from: {row['Basic Price']!r}")
-    row["Basic Price"] = thousands
+    added = 0
+    for pdf_path in pdfs:
+        if pdf_path.name in processed:
+            continue
+        try:
+            desc, code, raw_price = extract_ie07_row(pdf_path)
+            price = divide_thousands(raw_price)
+            if price is None:
+                print(f"Could not parse price in {pdf_path.name}; skipping."); continue
+            cdate = parse_date_from_filename(pdf_path.name)
+            events = add_event(events, desc, code or "IE07", price, cdate, link="")
+            processed.add(pdf_path.name); added += 1
+        except Exception as e:
+            print(f"Error processing {pdf_path.name}: {e}")
 
-    # Circular date: from filename (fallback to today)
-    row["Circular Date"] = parse_circular_date_from_filename(pdf_path)
-    # Link: the PDF URL used
-    row["Circular Link"] = pdf_url
+    save_processed_set(processed)
+    daily_df = build_daily_from_events(events, end_date=datetime.date.today())
+    save_excel_formatted(daily_df, EXCEL_FILE)
+    print(f"Backfill complete. Added {added} event(s). Rebuilt daily with {len(daily_df)} rows.")
 
-    total_rows = append_to_excel(EXCEL_FILE, row)
-    print(f"Excel updated: {EXCEL_FILE}")
+def run_repair():
+    events = load_events_from_excel_if_any()
+    if not events:
+        print("No events present to rebuild from."); return
+    daily_df = build_daily_from_events(events, end_date=datetime.date.today())
+    save_excel_formatted(daily_df, EXCEL_FILE)
+    print(f"Repair complete. Rebuilt daily with {len(daily_df)} rows.")
 
-    append_runlog(RUNLOG_FILE, {
-        "Run UTC": run_utc, "Run IST": run_ist, "Status": "UPDATED",
-        "Message": "New circular processed.", "Chosen URL": pdf_url,
-        "Saved PDF": pdf_path.name, "Rows Appended": 1, "Total Rows After": total_rows
-    })
+# ---------------- ENTRYPOINT ----------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--backfill", default="false", help="true/false (process all existing PDFs in pdfs/)")
+    ap.add_argument("--repair",   default="false", help="true/false (rebuild daily sheet from existing Excel)")
+    args = ap.parse_args()
+
+    if str(args.repair).strip().lower() in ("true","1","yes","y"):
+        run_repair()
+    elif str(args.backfill).strip().lower() in ("true","1","yes","y"):
+        run_backfill()
+    else:
+        run_normal()
 
 if __name__ == "__main__":
     main()
