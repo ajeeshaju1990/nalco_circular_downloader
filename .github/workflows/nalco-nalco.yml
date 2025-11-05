@@ -1,45 +1,65 @@
-name: Nalco PDF Downloader
+name: Nalco Ingots PDF Download (Daily → Forward-Fill)
 
 on:
-  workflow_dispatch: {}
   schedule:
-    # 09:00, 12:00, 15:00, 18:00 IST = 03:30, 06:30, 09:30, 12:30 UTC
-    - cron: "30 3,6,9,12 * * *"
+    - cron: '30 3 * * *'   # 09:00 IST
+    - cron: '30 6 * * *'   # 12:00 IST
+    - cron: '30 9 * * *'   # 15:00 IST
+    - cron: '30 12 * * *'  # 18:00 IST
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: "Process ALL existing PDFs in pdfs/ once"
+        required: false
+        default: "false"
+      repair:
+        description: "Rebuild daily sheet from existing Excel (migrate/forward-fill)"
+        required: false
+        default: "false"
 
 permissions:
   contents: write
 
 jobs:
-  scrape:
+  run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           persist-credentials: true
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install requirements
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run scraper
+      - name: Download + Extract + Update Excel (daily forward-fill)
         run: |
-          python nalco_scraper.py
+          python nalco_scraper.py --backfill "${{ github.event.inputs.backfill }}" --repair "${{ github.event.inputs.repair }}"
 
-      - name: Commit & push if changed
+      - name: Commit and push changes
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m "Update Nalco PDF ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
-            git push
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name  "github-actions[bot]"
+
+          echo "Workspace:"; ls -lah
+          echo "PDFs:"; ls -lah pdfs || true
+          echo "Data:"; ls -lah data || true
+
+          # Force-add artifacts (in case .gitignore blocks)
+          git add -f pdfs/*.pdf data/*.xlsx data/*.txt data/*.json || true
+
+          echo "Staged files:"; git diff --cached --name-only || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
           else
-            echo "No changes to commit."
+            git commit -m "Nalco: update PDFs & daily Excel ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
+            git push
           fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
