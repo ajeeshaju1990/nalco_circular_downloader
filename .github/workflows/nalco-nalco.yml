@@ -14,17 +14,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Not strictly needed by the script, but handy for future; we run inside this folder.
+  # Optional: your script supports BASE_DIR, but root is fine
   BASE_DIR: .
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-
-    # All shell steps below run inside this subfolder
-    defaults:
-      run:
-        working-directory: nalco_circular_downloader
 
     steps:
       - name: Checkout
@@ -56,38 +51,35 @@ jobs:
         env:
           BASE_DIR: ${{ env.BASE_DIR }}
         run: |
-          echo "Running nalco_scraper.py in $(pwd)"
+          echo "PWD before run: $(pwd)"
           python nalco_scraper.py
           echo "Scraper finished."
 
       - name: List outputs
         run: |
-          echo "PWD: $(pwd)"
           echo "--- pdfs/"
           ls -la pdfs || true
           echo "--- data/"
           ls -la data || true
 
-      # Upload artifacts only if they exist (prevents failures when nothing is produced)
+      # Upload artifacts only if they exist (v4 required)
       - name: Upload PDF artifacts (if any)
-        if: ${{ hashFiles('nalco_circular_downloader/pdfs/*.pdf') != '' }}
+        if: ${{ hashFiles('pdfs/*.pdf') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: nalco-pdfs
-          path: nalco_circular_downloader/pdfs/*.pdf
+          path: pdfs/*.pdf
           if-no-files-found: ignore
 
       - name: Upload Excel artifact (if exists)
-        if: ${{ hashFiles('nalco_circular_downloader/data/nalco_prices.xlsx') != '' }}
+        if: ${{ hashFiles('data/nalco_prices.xlsx') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: nalco-prices-xlsx
-          path: nalco_circular_downloader/data/nalco_prices.xlsx
+          path: data/nalco_prices.xlsx
           if-no-files-found: ignore
 
-      # Commit & push changes (Excel/log/PDFs) if repo content changed
-      - name: Commit & push if changed (repo root)
-        working-directory: .
+      - name: Commit & push if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
