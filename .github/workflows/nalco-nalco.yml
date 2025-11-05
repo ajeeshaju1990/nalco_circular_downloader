@@ -1,74 +1,65 @@
-name: Nalco PDF downloader
-
-# give the GITHUB_TOKEN permission to write repo contents so the workflow can push
-permissions:
-  contents: write
+name: Nalco Ingots PDF Download (Daily → Forward-Fill)
 
 on:
+  schedule:
+    - cron: '30 3 * * *'   # 09:00 IST
+    - cron: '30 6 * * *'   # 12:00 IST
+    - cron: '30 9 * * *'   # 15:00 IST
+    - cron: '30 12 * * *'  # 18:00 IST
   workflow_dispatch:
     inputs:
       backfill:
-        description: "Process all PDFs in pdfs/ (true/false)"
+        description: "Process ALL existing PDFs in pdfs/ once"
         required: false
         default: "false"
       repair:
-        description: "Repair/migrate existing Excel into event/daily format (true/false)"
+        description: "Rebuild daily sheet from existing Excel (migrate/forward-fill)"
         required: false
         default: "false"
-      page_url:
-        description: "Nalco page URL to look for PDFs (optional)"
-        required: false
-        default: ""
+
+permissions:
+  contents: write
 
 jobs:
-  build:
+  run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           persist-credentials: true
-          fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install requirements
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Ensure directories
+      - name: Download + Extract + Update Excel (daily forward-fill)
         run: |
-          mkdir -p pdfs data
+          python nalco_scraper.py --backfill "${{ github.event.inputs.backfill }}" --repair "${{ github.event.inputs.repair }}"
 
-      - name: Run nalco scraper
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name  "github-actions[bot]"
+
+          echo "Workspace:"; ls -lah
+          echo "PDFs:"; ls -lah pdfs || true
+          echo "Data:"; ls -lah data || true
+
+          # Force-add artifacts (in case .gitignore blocks)
+          git add -f pdfs/*.pdf data/*.xlsx data/*.txt data/*.json || true
+
+          echo "Staged files:"; git diff --cached --name-only || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Nalco: update PDFs & daily Excel ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
+            git push
+          fi
         env:
-          PDFS_DIR: pdfs
-          DATA_FILE: data/nalco_prices.xlsx
-          NALCO_PAGE_URL: ${{ github.event.inputs.page_url || '' }}
-        run: |
-          BACKFILL="${{ github.event.inputs.backfill || 'false' }}"
-          REPAIR="${{ github.event.inputs.repair || 'false' }}"
-          ARGS=()
-          if [ "$BACKFILL" = "true" ]; then
-            ARGS+=("--backfill")
-          fi
-          if [ "$REPAIR" = "true" ]; then
-            ARGS+=("--repair")
-          fi
-          if [ -n "${NALCO_PAGE_URL}" ]; then
-            ARGS+=("--page-url" "${NALCO_PAGE_URL}")
-          fi
-          echo "Running nalco_scraper.py with args: ${ARGS[*]}"
-          python nalco_scraper.py "${ARGS[@]}"
-
-      - name: Commit PDFs and Excel (force commit even if nothing changed)
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pdfs data/nalco_prices.xlsx || true
-          git commit -m "Update Nalco PDFs and data" --allow-empty || true
-          git push
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
