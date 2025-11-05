@@ -150,24 +150,29 @@ def extract_ie07_row(pdf_path: pathlib.Path) -> tuple[str, str, str]:
 # ---------------- EVENT/DATES HELPERS ----------------
 def _to_date_any(x) -> datetime.date | None:
     """
-    Accept strings like '15.10.2025', pandas.Timestamp, or datetime.date.
+    Accept strings like '01-11-2025' / '01.11.2025' / '2025-11-01',
+    and pandas/Excel date types.
     """
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return None
-    # pandas Timestamp
     if isinstance(x, pd.Timestamp):
         return x.date()
-    # datetime.date / datetime.datetime
     if isinstance(x, (datetime.date, datetime.datetime)):
         return x.date() if isinstance(x, datetime.datetime) else x
-    # strings
     s = str(x).strip()
-    # Try dd.mm.yyyy
-    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+    # Try multiple common formats
+    for fmt in ("%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
         try:
             return datetime.datetime.strptime(s, fmt).date()
         except Exception:
             continue
+    # Last resort: pandas parser with dayfirst preference
+    try:
+        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+        if pd.notna(dt):
+            return dt.date()
+    except Exception:
+        pass
     return None
 
 def _fmt_date_dash(d: datetime.date) -> str:
@@ -175,6 +180,32 @@ def _fmt_date_dash(d: datetime.date) -> str:
 
 def _fmt_date_dot(d: datetime.date) -> str:
     return d.strftime("%d.%m.%Y")  # Circular Date column
+
+def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    # Strip spaces/newlines and unify common variants
+    mapping = {}
+    for c in df.columns:
+        k = str(c).strip().replace("\n", " ").replace("\r", " ")
+        mapping[c] = k
+    df = df.rename(columns=mapping)
+    # Known alias normalizations (if any)
+    aliases = {
+        "Sl.no.": "Sl.no.",
+        "Sl No": "Sl.no.",
+        "Sl No.": "Sl.no.",
+        "Product code": "Product Code",
+        "product code": "Product Code",
+        "Basic price": "Basic Price",
+        "basic price": "Basic Price",
+        "Circular date": "Circular Date",
+        "circular date": "Circular Date",
+        "Circular link": "Circular Link",
+        "circular link": "Circular Link",
+    }
+    for k, v in list(df.columns.map(lambda x: (x, aliases.get(x, x)))):
+        if k != v:
+            df = df.rename(columns={k: v})
+    return df
 
 def load_events_from_excel_if_any() -> list[dict]:
     """
@@ -187,11 +218,12 @@ def load_events_from_excel_if_any() -> list[dict]:
         print("[INFO] Excel not found; no existing events.")
         return []
     df = pd.read_excel(EXCEL_FILE)
-    cols = [c.strip() for c in df.columns]
+    df = _normalize_headers(df)
+    cols = list(df.columns)
     print(f"[INFO] Loaded Excel with columns: {cols}")
 
-    if "Sl.no." in cols:
-        # Old format
+    # Determine mode by presence of "Sl.no." vs "Date"
+    if "Sl.no." in cols and "Date" not in cols:
         keep = ["Description","Product Code","Basic Price","Circular Date","Circular Link"]
         for k in keep:
             if k not in df.columns: df[k] = pd.NA
