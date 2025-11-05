@@ -1,3 +1,24 @@
+#!/usr/bin/env python3
+"""
+nalco_scraper.py
+
+Replaces previous nalco scraper script.
+
+Behavior:
+- normal (default): check the Nalco page for the latest Ingots PDF, download if new,
+  parse IE07 row, append events, rebuild a daily sheet up to today and write data/nalco_prices.xlsx.
+- --backfill: parse all PDFs present in pdfs/ to build event list and rebuild daily sheet.
+- --repair: read the existing data/nalco_prices.xlsx and convert/migrate old format into the
+  new event/daily format, then rebuild daily sheet (does not fetch new PDFs).
+
+Notes:
+- The Nalco page URL can be provided with --page-url. If not provided, the script will try
+  a reasonable default (please change if your target page is different).
+- PDFs are stored in pdfs/ and the Excel in data/nalco_prices.xlsx by default.
+- The script uses pdfplumber to extract text/tables. Parsing PDFs is inherently brittle;
+  the parser tries multiple heuristics to find the IE07 row.
+"""
+
 from __future__ import annotations
 import argparse
 import os
@@ -234,7 +255,7 @@ def heuristic_from_snippet(snippet: str, pdf_path: str, circular_link: Optional[
     m2 = re.search(r"(\d[\d,\.]+\d)", snippet)
     price = None
     if m2:
-        price = re.sub(r"[^\d\.]", "", m2.group(1))
+        price = re.sub(r"[^\d.]", "", m2.group(1))
     # product code
     m3 = re.search(r"([A-Z]{1,3}\s?\d{1,4})", snippet)
     code = m3.group(1) if m3 else ""
@@ -290,6 +311,9 @@ def read_existing_events_from_excel(path: str) -> List[Dict[str, Any]]:
                     "Circular Link": r.get("Circular Link", r.get("Link", "")),
                     "Source PDF": r.get("Source PDF", ""),
                 })
+            except Exception:
+                # skip rows we can't parse
+                continue
         return events
 
     # Otherwise try to inspect the first sheet for rows that look like circulars (old format)
@@ -299,19 +323,23 @@ def read_existing_events_from_excel(path: str) -> List[Dict[str, Any]]:
     if possible_date_cols:
         date_col = possible_date_cols[0]
         for _, r in df.iterrows():
-            cdate = r.get(date_col)
-            if pd.isna(cdate):
+            try:
+                cdate = r.get(date_col)
+                if pd.isna(cdate):
+                    continue
+                if not isinstance(cdate, (datetime, date)):
+                    cdate = parse_date_from_text(str(cdate))
+                events.append({
+                    "Description": r.get("Description", ""),
+                    "Product Code": r.get("Product Code", r.get("Product_Code", "")),
+                    "Basic Price": float(r.get("Basic Price", r.get("Basic_Price", 0))) if not pd.isna(r.get("Basic Price", None)) else None,
+                    "Circular Date": cdate,
+                    "Circular Link": r.get("Circular Link", ""),
+                    "Source PDF": r.get("Source PDF", ""),
+                })
+            except Exception:
+                # skip unparsable rows
                 continue
-            if not isinstance(cdate, (datetime, date)):
-                cdate = parse_date_from_text(str(cdate))
-            events.append({
-                "Description": r.get("Description", ""),
-                "Product Code": r.get("Product Code", r.get("Product_Code", "")),
-                "Basic Price": float(r.get("Basic Price", r.get("Basic_Price", 0))) if not pd.isna(r.get("Basic Price", None)) else None,
-                "Circular Date": cdate,
-                "Circular Link": r.get("Circular Link", r.get("Link", "")),
-                "Source PDF": r.get("Source PDF", ""),
-            })
         return events
 
     # Last fallback: no usable data
@@ -376,13 +404,13 @@ def save_to_excel(events: List[Dict[str, Any]], daily_df: pd.DataFrame, path: st
         shutil.copy2(path, backup)
         print(f"Backed up existing {path} to {backup}")
 
-    events_df = pd.DataFrame([{
-        "Description": e.get("Description", ""),
-        "Product Code": e.get("Product Code", ""),
-        "Basic Price": e.get("Basic Price", ""),
-        "Circular Date": e.get("Circular Date", ""),
-        "Circular Link": e.get("Circular Link", ""),
-        "Source PDF": e.get("Source PDF", ""),
+    events_df = pd.DataFrame([{  
+        "Description": e.get("Description", ""),  
+        "Product Code": e.get("Product Code", ""),  
+        "Basic Price": e.get("Basic Price", ""),  
+        "Circular Date": e.get("Circular Date", ""),  
+        "Circular Link": e.get("Circular Link", ""),  
+        "Source PDF": e.get("Source PDF", ""), 
     } for e in events])
 
     # Ensure Circular Date is datetime-like
@@ -390,7 +418,12 @@ def save_to_excel(events: List[Dict[str, Any]], daily_df: pd.DataFrame, path: st
         events_df["Circular Date"] = pd.to_datetime(events_df["Circular Date"])
 
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        events_df.sort_values("Circular Date").to_excel(writer, sheet_name="events", index=False)
+        if not events_df.empty:
+            events_df.sort_values("Circular Date").to_excel(writer, sheet_name="events", index=False)
+        else:
+            # write empty events sheet with columns
+            pd.DataFrame(columns=["Description", "Product Code", "Basic Price", "Circular Date", "Circular Link", "Source PDF"]).to_excel(writer, sheet_name="events", index=False)
+
         daily_df_sorted = daily_df.copy()
         if not daily_df_sorted.empty:
             daily_df_sorted["Date"] = pd.to_datetime(daily_df_sorted["Date"])
@@ -416,7 +449,6 @@ def parse_all_pdfs(pdfs: List[str], circular_link_template: Optional[str]) -> Li
             events.append(parsed)
     # deduplicate by Circular Date + Product Code: keep latest by Source PDF name
     seen = {}
-    out = []
     for e in sorted(events, key=lambda x: (x.get("Circular Date") or date.min, x.get("Source PDF") or "")):
         key = (e.get("Circular Date"), e.get("Product Code"))
         seen[key] = e
@@ -482,6 +514,7 @@ def main(argv=None):
     daily = build_daily_sheet(events, until_date)
     save_to_excel(events, daily, args.data_file)
     print("Done.")
+
 
 if __name__ == "__main__":
     main()
