@@ -3,3 +3,4 @@ beautifulsoup4
 pdfplumber
 pandas
 openpyxl
+python-dateutil
