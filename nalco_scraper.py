@@ -373,8 +373,11 @@ def append_runlog(log_path: pathlib.Path, info: dict):
     center = Alignment(horizontal="center", vertical="center")
     for col_idx, col_name in enumerate(df.columns, start=1):
         max_len = len(str(col_name))
-        for val in df[col_name].astype(str).values:
-            max_len = max(max_len, len(val))
+        for val in df[col_name].values:
+            if pd.isna(val):
+                continue
+            sval = str(val)
+            max_len = max(max_len, len(sval))
         ws.column_dimensions[get_column_letter(col_idx)].width = max(10, min(max_len + 2, 100))
     for r in range(1, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
