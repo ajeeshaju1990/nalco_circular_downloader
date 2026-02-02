@@ -1,3 +1,4 @@
+
 import os, sys, time, pathlib, re, requests, datetime
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
@@ -93,7 +94,8 @@ def download_pdf(url):
     with requests.get(url, headers=headers, timeout=60, stream=True, allow_redirects=True) as r:
         r.raise_for_status()
         ctype = r.headers.get("Content-Type", "").lower()
-        if "application/pdf" not in ctype:
+        # Be strict, but allow empty content-type (some servers omit)
+        if ctype and "application/pdf" not in ctype:
             raise RuntimeError(f"Expected PDF but got Content-Type={ctype!r} from {url}")
         filename = None
         cd = r.headers.get("Content-Disposition", "")
@@ -208,13 +210,15 @@ def save_excel_formatted(df: pd.DataFrame, path: pathlib.Path):
 
     center = Alignment(horizontal="center", vertical="center")
 
-    # Auto width
+    # Auto width (robust to NaN/None/numerics)
     for col_idx, col_name in enumerate(df.columns, start=1):
         max_len = len(str(col_name))
-        for val in df[col_name].astype(str).values:
-            if val is None:
+        for val in df[col_name].values:
+            if pd.isna(val):
                 continue
-            max_len = max(max_len, len(val))
+            s = str(val)
+            if len(s) > max_len:
+                max_len = len(s)
         ws.column_dimensions[get_column_letter(col_idx)].width = max(10, min(max_len + 2, 80))
 
     header_row = 1
@@ -282,15 +286,15 @@ def build_daily_df_from_circulars(circ_df: pd.DataFrame) -> pd.DataFrame:
     filled.index.name = "Date"
     daily = filled.reset_index()
 
-    # We also want the "Circular Date" column to reflect the last circular date that applied:
-    # After ffill, the "where it came from" is the index of last valid entry. We can compute
-    # by merging against the forward-filled mask of original dates.
-    # Easiest: carry a helper series of the original index and ffill it too.
-    key = pd.Series(circ_df.set_index("Circular Date").index, index=circ_df.set_index("Circular Date").index, name="Circular Date").reindex(full_range).ffill()
+    # Carry "Circular Date" as the last valid index date after ffill
+    key = pd.Series(
+        circ_df.set_index("Circular Date").index,
+        index=circ_df.set_index("Circular Date").index,
+        name="Circular Date"
+    ).reindex(full_range).ffill()
     daily["Circular Date"] = key.values
 
     # Final ordering & formatting
-    daily = daily.rename(columns={"Date": "Date"})
     daily["Date"] = pd.to_datetime(daily["Date"]).dt.strftime("%d-%m-%Y")
     daily["Circular Date"] = pd.to_datetime(daily["Circular Date"]).dt.strftime("%d-%m-%Y")
     daily = daily[DAILY_COLS]
@@ -371,11 +375,16 @@ def append_runlog(log_path: pathlib.Path, info: dict):
     wb = load_workbook(log_path)
     ws = wb.active
     center = Alignment(horizontal="center", vertical="center")
+
+    # Robust autosize: handle NaN/None/numerics
     for col_idx, col_name in enumerate(df.columns, start=1):
         max_len = len(str(col_name))
-        for val in df[col_name].astype(str).values:
-            max_len = max(max_len, len(val))
+        for val in df[col_name].values:
+            s = "" if pd.isna(val) else str(val)
+            if len(s) > max_len:
+                max_len = len(s)
         ws.column_dimensions[get_column_letter(col_idx)].width = max(10, min(max_len + 2, 100))
+
     for r in range(1, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
             ws.cell(row=r, column=c).alignment = center
@@ -421,55 +430,66 @@ def main():
     new_circular_detected = (pdf_url != last)
 
     if new_circular_detected:
-        # Step 2: fetch and parse new circular
-        pdf_path = download_pdf(pdf_url)
-        write_last_url(pdf_url)
-        chosen_pdf_path = pdf_path.name
-        print(f"Saved to: {pdf_path}")
+        try:
+            # Step 2: fetch and parse new circular
+            pdf_path = download_pdf(pdf_url)
+            write_last_url(pdf_url)
+            chosen_pdf_path = str(pdf_path)
+            print(f"Saved to: {pdf_path}")
 
-        # Extract IE07 row from PDF
-        row = extract_row_ie07(pdf_path)
+            # Extract IE07 row from PDF
+            row = extract_row_ie07(pdf_path)
 
-        # Convert Basic Price to thousands (e.g., 268250 -> 268.250)
-        thousands = to_thousands(row["Basic Price"])
-        if thousands is None:
-            raise RuntimeError(f"Could not parse numeric price from: {row['Basic Price']!r}")
-        row["Basic Price"] = thousands
+            # Convert Basic Price to thousands (e.g., 268250 -> 268.250)
+            thousands = to_thousands(row["Basic Price"])
+            if thousands is None:
+                raise RuntimeError(f"Could not parse numeric price from: {row['Basic Price']!r}")
+            row["Basic Price"] = thousands
 
-        # Circular date: from filename (fallback to today)
-        row["Circular Date"] = parse_circular_date_from_filename(pdf_path)
-        # Link: the PDF URL used
-        row["Circular Link"] = pdf_url
-        row["Description"] = row.get("Description", "ALUMINIUM INGOT")
-        row["Product Code"] = row.get("Product Code", "IE07")
+            # Circular date: from filename (fallback to today)
+            row["Circular Date"] = parse_circular_date_from_filename(pdf_path)
+            # Link: the PDF URL used
+            row["Circular Link"] = pdf_url
+            row["Description"] = row.get("Description", "ALUMINIUM INGOT")
+            row["Product Code"] = row.get("Product Code", "IE07")
 
-        # Build circulars dataframe from existing data, then add this circular (by Circular Date)
-        existing_df = pd.read_excel(EXCEL_FILE) if EXCEL_FILE.exists() else pd.DataFrame()
-        circ_df = derive_circulars_from_existing(existing_df)
+            # Build circulars dataframe from existing data, then add this circular (by Circular Date)
+            existing_df = pd.read_excel(EXCEL_FILE) if EXCEL_FILE.exists() else pd.DataFrame()
+            circ_df = derive_circulars_from_existing(existing_df)
 
-        # Upsert this circular by its Circular Date
-        new_c = pd.DataFrame([{
-            "Description": row["Description"],
-            "Product Code": row["Product Code"],
-            "Basic Price": row["Basic Price"],
-            "Circular Date": pd.to_datetime(row["Circular Date"], dayfirst=True, errors="coerce"),
-            "Circular Link": row["Circular Link"],
-        }])
-        circ_df = pd.concat([circ_df, new_c], ignore_index=True)
-        circ_df = circ_df.dropna(subset=["Circular Date"]).sort_values("Circular Date").drop_duplicates(subset=["Circular Date"], keep="last")
+            # Upsert this circular by its Circular Date
+            new_c = pd.DataFrame([{
+                "Description": row["Description"],
+                "Product Code": row["Product Code"],
+                "Basic Price": row["Basic Price"],
+                "Circular Date": pd.to_datetime(row["Circular Date"], dayfirst=True, errors="coerce"),
+                "Circular Link": row["Circular Link"],
+            }])
+            circ_df = pd.concat([circ_df, new_c], ignore_index=True)
+            circ_df = circ_df.dropna(subset=["Circular Date"]).sort_values("Circular Date").drop_duplicates(subset=["Circular Date"], keep="last")
 
-        # Step 3: rebuild DAILY sheet to yesterday IST
-        daily_df = build_daily_df_from_circulars(circ_df)
-        save_excel_formatted(daily_df[DAILY_COLS], EXCEL_FILE)
-        rows_appended = 1  # one new circular processed
+            # Step 3: rebuild DAILY sheet to yesterday IST
+            daily_df = build_daily_df_from_circulars(circ_df)
+            save_excel_formatted(daily_df[DAILY_COLS], EXCEL_FILE)
+            rows_appended = 1  # one new circular processed
 
-        append_runlog(RUNLOG_FILE, {
-            "Run UTC": run_utc, "Run IST": run_ist, "Status": "UPDATED",
-            "Message": "New circular processed and daily sheet rebuilt.",
-            "Chosen URL": pdf_url, "Saved PDF": chosen_pdf_path,
-            "Rows Appended": rows_appended, "Total Rows After": daily_df.shape[0]
-        })
-        return
+            append_runlog(RUNLOG_FILE, {
+                "Run UTC": run_utc, "Run IST": run_ist, "Status": "UPDATED",
+                "Message": "New circular processed and daily sheet rebuilt.",
+                "Chosen URL": pdf_url, "Saved PDF": chosen_pdf_path,
+                "Rows Appended": rows_appended, "Total Rows After": daily_df.shape[0]
+            })
+            return
+
+        except Exception as e:
+            # Ensure the failure is recorded in the run log before surfacing the exception
+            append_runlog(RUNLOG_FILE, {
+                "Run UTC": run_utc, "Run IST": run_ist, "Status": "FAILED",
+                "Message": f"Exception: {e}",
+                "Chosen URL": pdf_url, "Saved PDF": chosen_pdf_path,
+                "Rows Appended": 0, "Total Rows After": None
+            })
+            raise
 
     else:
         # No new PDF since last run – still rebuild DAILY sheet up to yesterday IST.
