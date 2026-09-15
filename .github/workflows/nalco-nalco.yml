@@ -11,10 +11,11 @@ permissions:
 
 concurrency:
   group: nalco-pdf-downloader
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
-  # Optional: your script supports BASE_DIR, but root is fine
+  # NALCO's legacy HTTPS certificate chain is rejected by GitHub-hosted runners.
+  # The workflow patches only the NALCO requests to use the controlled fallback.
   BASE_DIR: .
 
 jobs:
@@ -52,6 +53,40 @@ jobs:
           BASE_DIR: ${{ env.BASE_DIR }}
         run: |
           echo "PWD before run: $(pwd)"
+
+          # NALCO's certificate chain is not trusted by the hosted runner.
+          # Patch only the two NALCO HTTP requests in this workspace before
+          # running the scraper. This does not disable TLS verification globally.
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path("nalco_scraper.py")
+          s = p.read_text(encoding="utf-8")
+
+          replacements = [
+              (
+                  'requests.get(url, headers={"User-Agent": UA}, timeout=60)',
+                  'requests.get(url, headers={"User-Agent": UA}, timeout=60, verify=False)',
+              ),
+              (
+                  'requests.get(url, headers=headers, timeout=60, stream=True, allow_redirects=True)',
+                  'requests.get(url, headers=headers, timeout=60, stream=True, allow_redirects=True, verify=False)',
+              ),
+          ]
+
+          changed = False
+          for old, new in replacements:
+              if old in s:
+                  s = s.replace(old, new)
+                  changed = True
+
+          if changed:
+              p.write_text(s, encoding="utf-8")
+              print("Applied NALCO TLS fallback to page and PDF requests.")
+          else:
+              print("NALCO TLS fallback already present or source pattern changed; continuing.")
+          PY
+
           python nalco_scraper.py
           echo "Scraper finished."
 
@@ -62,7 +97,6 @@ jobs:
           echo "--- data/"
           ls -la data || true
 
-      # Upload artifacts only if they exist (v4 required)
       - name: Upload PDF artifacts (if any)
         if: ${{ hashFiles('pdfs/*.pdf') != '' }}
         uses: actions/upload-artifact@v4
@@ -86,7 +120,23 @@ jobs:
           git add -A
           if ! git diff --cached --quiet; then
             git commit -m "Update Nalco data ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
-            git push
+
+            # Rebase onto the latest main in case a repository update landed
+            # while this job was running, then push the generated data.
+            for attempt in 1 2 3; do
+              git fetch origin main
+              if git rebase origin/main; then
+                if git push origin HEAD:main; then
+                  echo "Push succeeded on attempt ${attempt}."
+                  exit 0
+                fi
+              fi
+              git rebase --abort || true
+              sleep 2
+            done
+
+            echo "Could not push after 3 attempts." >&2
+            exit 1
           else
             echo "No changes to commit."
           fi
