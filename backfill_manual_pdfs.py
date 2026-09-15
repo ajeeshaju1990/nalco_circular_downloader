@@ -47,16 +47,26 @@ def main() -> int:
 
     for manual_pdf in manual_pdfs:
         try:
-            # Copy into the normal PDF archive so it is included with outputs.
-            archived_pdf = PDF_DIR / manual_pdf.name
-            if not archived_pdf.exists() or archived_pdf.stat().st_size != manual_pdf.stat().st_size:
-                shutil.copy2(manual_pdf, archived_pdf)
+            # Only accept the standard NALCO filename convention so a badly named
+            # PDF can never accidentally be assigned today's date.
+            date_match = scraper.DATEY_PDF_RE.search(manual_pdf.name)
+            if not date_match:
+                raise RuntimeError(
+                    "Filename must follow Ingot-DD-MM-YYYY.pdf "
+                    f"(received {manual_pdf.name!r})"
+                )
 
             circular_date = scraper.parse_circular_date_from_filename(manual_pdf)
             parsed = scraper.extract_row_ie07(manual_pdf)
             price = scraper.to_thousands(parsed.get("Basic Price"))
             if price is None:
                 raise RuntimeError(f"Invalid IE07 price: {parsed.get('Basic Price')!r}")
+
+            # Copy into the normal PDF archive so the source PDF remains available
+            # alongside automated downloads.
+            archived_pdf = PDF_DIR / manual_pdf.name
+            if not archived_pdf.exists() or archived_pdf.stat().st_size != manual_pdf.stat().st_size:
+                shutil.copy2(manual_pdf, archived_pdf)
 
             row = {
                 "Description": parsed.get("Description", "ALUMINIUM INGOT"),
@@ -66,29 +76,26 @@ def main() -> int:
                 "Circular Link": github_manual_link(manual_pdf.name),
             }
 
-            new_df = pd.DataFrame([row])
-            combined = pd.concat([circ_df, new_df], ignore_index=True)
-            combined["Circular Date"] = pd.to_datetime(combined["Circular Date"], dayfirst=True, errors="coerce")
-            combined["Basic Price"] = pd.to_numeric(combined["Basic Price"], errors="coerce").round(3)
+            # Upsert by Circular Date. This makes reruns idempotent and lets the
+            # manually supplied PDF override an existing value for the same date.
+            combined = pd.concat([circ_df, pd.DataFrame([row])], ignore_index=True)
+            combined["Circular Date"] = pd.to_datetime(
+                combined["Circular Date"], dayfirst=True, errors="coerce"
+            )
+            combined["Basic Price"] = pd.to_numeric(
+                combined["Basic Price"], errors="coerce"
+            ).round(3)
             combined = combined.dropna(subset=["Circular Date"])
-            combined = (
+            circ_df = (
                 combined.sort_values("Circular Date")
                 .drop_duplicates(subset=["Circular Date"], keep="last")
                 .reset_index(drop=True)
             )
 
-            if len(combined) == len(circ_df) and not circ_df.empty:
-                # Same circular date already exists; replace it only when the source
-                # manual PDF is more explicit. This keeps reruns idempotent.
-                existing_dates = set(pd.to_datetime(circ_df["Circular Date"]).dt.strftime("%d-%m-%Y"))
-                if circular_date in existing_dates:
-                    # Rebuild above already replaced the date's data.
-                    pass
-
-            circ_df = combined
             processed += 1
             print(
-                f"Backfilled {manual_pdf.name}: circular date={circular_date}, IE07={price:.3f}"
+                f"Backfilled {manual_pdf.name}: "
+                f"circular date={circular_date}, IE07={price:.3f}"
             )
 
         except Exception as exc:
@@ -96,21 +103,23 @@ def main() -> int:
             failures.append(f"{manual_pdf.name}: {exc}")
             print(f"[WARN] Could not process {manual_pdf.name}: {exc}", file=sys.stderr)
 
-    # Rebuild the daily series from all known circulars, including manual backfill.
+    # Rebuild the full daily history using every known circular, including the
+    # newly supplied manual PDFs.
     daily_df = scraper.build_daily_df_from_circulars(circ_df)
     if not daily_df.empty:
         scraper.save_excel_formatted(daily_df[scraper.DAILY_COLS], EXCEL_FILE)
 
-    # Do not fail the entire workflow because one manually supplied PDF is bad.
     print(
         f"Manual backfill complete: processed={processed}, failed={skipped}, "
         f"circulars={len(circ_df)}, daily rows={len(daily_df)}"
     )
+
     if failures:
         print("Failed files:", file=sys.stderr)
         for item in failures:
             print(f" - {item}", file=sys.stderr)
 
+    # Deliberately do not fail the workflow because one optional manual PDF was bad.
     return 0
 
 
