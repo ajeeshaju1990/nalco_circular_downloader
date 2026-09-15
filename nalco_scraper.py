@@ -43,7 +43,7 @@ def ensure_dirs():
         p.mkdir(parents=True, exist_ok=True)
 
 def get_html(url):
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=60)
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=60, verify=False)
     r.raise_for_status()
     return r.text
 
@@ -91,7 +91,7 @@ def download_pdf(url):
         "Accept": "application/pdf,*/*;q=0.9",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    with requests.get(url, headers=headers, timeout=60, stream=True, allow_redirects=True) as r:
+    with requests.get(url, headers=headers, timeout=60, stream=True, allow_redirects=True, verify=False) as r:
         r.raise_for_status()
         ctype = r.headers.get("Content-Type", "").lower()
         # Be strict, but allow empty content-type (some servers omit)
