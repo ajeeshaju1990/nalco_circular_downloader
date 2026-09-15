@@ -47,16 +47,13 @@ jobs:
         run: |
           mkdir -p pdfs
           mkdir -p data
+          mkdir -p manual_pdfs
 
-      - name: Run scraper
-        env:
-          BASE_DIR: ${{ env.BASE_DIR }}
+      - name: Prepare NALCO TLS fallback
         run: |
-          echo "PWD before run: $(pwd)"
-
           # NALCO's certificate chain is not trusted by the hosted runner.
           # Patch only the two NALCO HTTP requests in this workspace before
-          # running the scraper. This does not disable TLS verification globally.
+          # running either the manual backfill processor or the live scraper.
           python - <<'PY'
           from pathlib import Path
 
@@ -87,6 +84,15 @@ jobs:
               print("NALCO TLS fallback already present or source pattern changed; continuing.")
           PY
 
+      - name: Backfill manual circular PDFs
+        run: |
+          python backfill_manual_pdfs.py
+
+      - name: Run scraper
+        env:
+          BASE_DIR: ${{ env.BASE_DIR }}
+        run: |
+          echo "PWD before run: $(pwd)"
           python nalco_scraper.py
           echo "Scraper finished."
 
@@ -94,6 +100,8 @@ jobs:
         run: |
           echo "--- pdfs/"
           ls -la pdfs || true
+          echo "--- manual_pdfs/"
+          ls -la manual_pdfs || true
           echo "--- data/"
           ls -la data || true
 
